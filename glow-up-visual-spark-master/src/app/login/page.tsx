@@ -70,8 +70,12 @@ export default function Login() {
           >
             {loading ? 'Signing in...' : 'Sign In'}
           </Button>
+          <div className="text-center text-sm">
+            <a href="#" className="text-blue-600 hover:underline">Forgot password?</a>
+            <span className="mx-2 text-gray-400">|</span>
+            <a href="/signup" className="text-blue-600 hover:underline">Create account</a>
+          </div>
         </form>
-
         <p className="mt-2 text-center text-sm text-gray-600">
           Don't have an account?{' '}
           <a href="/register" className="text-[#004aad] hover:underline font-semibold">Sign Up</a>

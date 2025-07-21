@@ -19,15 +19,22 @@ import { Search, Plus, Trash2, Clock, Activity, Loader2, Filter, ChevronDown, Ch
 import Link from 'next/link';
 import { format, isAfter, isBefore, addHours } from 'date-fns';
 import { cn } from '@/lib/utils';
-import { Grant, GrantStatus } from '@/types';
+import { Grant, GrantStatus, UserRole } from '@/types';
 import Image from 'next/image';
-
+import { RoleSwitcher } from '@/components/role-switcher';
 
 export default function DashboardPage() {
-  const { user, loading, signOut } = useAuth();
+  const { user, loading, signOut, currentRole, switchRole } = useAuth();
   const { grants } = useGrants();
   const router = useRouter();
   const [searchQuery, setSearchQuery] = useState('');
+
+  // Handle role switching
+  const handleRoleChange = async (role: string) => {
+    await switchRole(role as any);
+    // Force a refresh to ensure the UI updates
+    router.refresh();
+  };
   
   // Filter grants based on search query
   const filteredGrants = searchQuery
@@ -39,10 +46,23 @@ export default function DashboardPage() {
     : grants;
 
   useEffect(() => {
-    if (!loading && !user) {
-      router.replace('/login');
+    if (!loading) {
+      if (!user) {
+        router.replace('/login');
+      } else if (currentRole === 'clerk') {
+        router.replace('/clerk-dashboard');
+      }
     }
-  }, [user, loading, router]);
+  }, [user, loading, router, currentRole]);
+
+  // If no role is set yet, show loading
+  if (loading || !currentRole) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <Loader2 className="h-8 w-8 animate-spin" />
+      </div>
+    );
+  }
 
   if (loading) {
     return (
@@ -93,6 +113,11 @@ export default function DashboardPage() {
             <h1 className="text-xl font-semibold text-gray-800">Family and Fellows Foundation</h1>
           </div>
           <div className="flex items-center space-x-4">
+            <RoleSwitcher 
+              roles={user?.roles || []} 
+              currentRole={currentRole || 'viewer'}
+              onRoleChange={handleRoleChange}
+            />
             <Button 
               variant="outline"
               onClick={signOut}
@@ -261,7 +286,7 @@ function UnifiedGrantsTable({ role }: { role: string }) {
       const matchesSearch =
         (grant.name?.toLowerCase().includes(searchLower) ||
           grant.donor?.toLowerCase().includes(searchLower) ||
-          grant.summary?.toLowerCase().includes(searchLower)) ?? false;
+          (grant as any).summary?.toLowerCase().includes(searchLower)) ?? false;
       const matchesStatus = !filters.status || grant.status === filters.status;
       return matchesSearch && matchesStatus && !!grant.name;
     })

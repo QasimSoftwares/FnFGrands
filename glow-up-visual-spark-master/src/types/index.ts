@@ -1,6 +1,6 @@
-import { Database } from '@/types/supabase'
+// Database types will be defined here
 
-export type UserRole = 'admin' | 'reviewer' | 'editor' | 'viewer'
+export type UserRole = 'admin' | 'viewer' | 'clerk'
 
 export interface UserProfile {
   id: string
@@ -8,8 +8,10 @@ export interface UserProfile {
   first_name: string | null
   last_name: string | null
   role: UserRole
+  roles: UserRole[]
   created_at: string
   updated_at: string
+  full_name?: string
 }
 
 // Status type with proper casing to match UI
@@ -81,5 +83,8 @@ export interface ApiResponse<T> {
   meta?: PaginationMeta
 }
 
-// Re-export the Database type from Supabase
-export type { Database } from '@/types/supabase'
+// Database type definition
+export interface Database {
+  // Add your database types here if needed
+  [key: string]: any;
+}

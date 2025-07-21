@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
-import { useAuth } from '@/contexts/auth-context'
+import { useAuth } from "@/contexts/auth-context"
 
 export default function Register() {
   const [email, setEmail] = useState('')
@@ -46,12 +46,10 @@ export default function Register() {
     setIsLoading(true);
     
     try {
-      const result = await signUp(email, password, {
-        full_name: fullName.trim()
-      });
+      const { error, user, isFirstUser } = await signUp(email, password, fullName.trim());
       
-      if (!result) {
-        throw new Error('Registration failed. Please try again.');
+      if (error) {
+        throw error;
       }
       
       // If we get here, registration was successful
@@ -64,23 +62,10 @@ export default function Register() {
       setConfirmPassword('');
       setFullName('');
       
-      // Handle successful registration
-      if (result.requiresEmailConfirmation) {
-        // Show email confirmation message
-        setRegistrationSuccess(true);
-        setRegisteredEmail(email);
-      } else if (result.session) {
-        // Auto-login was successful, redirect to dashboard
-        try {
-          // Wait a moment to ensure the session is fully established
-          await new Promise(resolve => setTimeout(resolve, 500));
-          router.push('/dashboard');
-        } catch (error) {
-          console.error('Redirect error:', error);
-          // Fallback to home if dashboard redirect fails
-          router.push('/');
-        }
-      }
+      // Redirect to dashboard after a short delay
+      setTimeout(() => {
+        router.push('/dashboard');
+      }, 2000);
     } catch (error: any) {
       // Error message is already formatted by the auth context
       setError(error.message || 'An error occurred during registration');

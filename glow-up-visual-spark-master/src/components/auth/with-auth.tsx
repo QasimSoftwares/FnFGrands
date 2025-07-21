@@ -1,6 +1,6 @@
 import { useRouter } from 'next/navigation'
 import { useEffect, ComponentType } from 'react'
-import { useAuth } from '@/contexts/auth-context'
+import { useAuth } from "@/contexts/auth-context"
 import { UserRole } from '@/types'
 
 type WithAuthProps = {
