@@ -1,0 +1,674 @@
+'use client';
+
+import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
+import { getSupabaseClient } from '@/lib/supabase/client';
+import { User, Session } from '@supabase/supabase-js';
+
+type UserRole = 'admin' | 'viewer';
+
+interface AppUser extends User {
+  role: UserRole;
+  full_name?: string;
+  user_metadata?: {
+    [key: string]: any;
+    avatar_url?: string;
+  };
+}
+
+interface AuthContextType {
+  user: AppUser | null;
+  session: Session | null;
+  loading: boolean;
+  error: Error | null;
+  signIn: (email: string, password: string, rememberMe?: boolean) => Promise<{ error: Error | null }>;
+  signUp: (email: string, password: string) => Promise<{ error: Error | null }>;
+  signOut: () => Promise<void>;
+  resetPassword: (email: string) => Promise<{ error: Error | null }>;
+}
+
+const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+type UserRole = 'admin' | 'viewer';
+
+type AppUser = Omit<User, 'user_metadata'> & {
+  role: UserRole;
+  full_name?: string;
+  user_metadata?: {
+    [key: string]: any;
+  };
+};
+
+type AuthContextType = {
+  user: AppUser | null;
+  session: Session | null;
+  loading: boolean;
+  error: Error | null;
+  signIn: (email: string, password: string, rememberMe?: boolean) => Promise<{ error: Error | null }>;
+  signUp: (email: string, password: string) => Promise<{ error: Error | null }>;
+  signOut: () => Promise<void>;
+  resetPassword: (email: string) => Promise<{ error: Error | null }>;
+};
+
+const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState<AppUser | null>(null);
+  const [session, setSession] = useState<Session | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<Error | null>(null);
+  const router = useRouter();
+
+  // Session marker logic
+  useEffect(() => {
+    console.log('[Auth] Setting up session marker');
+    
+    const SESSION_MARKER = 'grant_tracker_active_tab';
+    const SUPABASE_SESSION_KEY_PREFIX = 'sb-';
+    
+    const cleanup = () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('unload', handleUnload);
+      }
+    };
+    
+    const handleUnload = () => {
+      if (sessionStorage) {
+        sessionStorage.removeItem(SESSION_MARKER);
+      }
+    };
+    
+    if (typeof window !== 'undefined' && sessionStorage) {
+      const hasMarker = sessionStorage.getItem(SESSION_MARKER);
+      const hasSupabaseSession = Object.keys(sessionStorage).some(k => k.startsWith(SUPABASE_SESSION_KEY_PREFIX));
+      
+      if (!hasMarker && hasSupabaseSession) {
+        Object.keys(sessionStorage).forEach(k => {
+          if (k.startsWith(SUPABASE_SESSION_KEY_PREFIX)) sessionStorage.removeItem(k);
+        });
+        window.location.reload();
+        return cleanup;
+      }
+      
+      sessionStorage.setItem(SESSION_MARKER, '1');
+      window.addEventListener('unload', handleUnload);
+    }
+    
+    return cleanup;
+  }, []);
+
+  const getProfileAndSetUser = useCallback(async (session: Session | null, attempt = 1) => {
+    if (!session?.user) return null;
+
+    const maxAttempts = 3;
+    const retryDelay = 1000;
+
+    try {
+      const { data: profile, error } = await getSupabaseClient()
+        .from('profiles')
+        .select('*')
+        .eq('id', session.user.id)
+        .single();
+
+      if (error) throw error;
+
+      const userData = {
+        ...session.user,
+        role: (profile?.role as UserRole) || 'viewer',
+        full_name: profile?.full_name,
+        user_metadata: {
+          ...session.user.user_metadata,
+          avatar_url: profile?.avatar_url,
+        },
+      };
+
+      setUser(userData);
+      setSession(session);
+      setError(null);
+      return userData;
+    } catch (error) {
+      console.error(`[Auth] Error fetching profile (attempt ${attempt}):`, error);
+      
+      if (attempt < maxAttempts) {
+        console.log(`[Auth] Retrying profile fetch (${attempt + 1}/${maxAttempts})...`);
+        await new Promise(resolve => setTimeout(resolve, retryDelay * attempt));
+        return getProfileAndSetUser(session, attempt + 1);
+      }
+      
+      console.error('[Auth] Max profile fetch attempts reached');
+      setError(error instanceof Error ? error : new Error('Failed to load user profile'));
+      return null;
+    }
+  }, []);
+
+  const handleSession = useCallback(async (session: Session): Promise<boolean> => {
+    try {
+      const userData = await getProfileAndSetUser(session);
+      if (!userData) return false;
+      
+      setSession(session);
+      
+      if (router) {
+        const redirectPath = userData.role === 'admin' ? '/dashboard' : '/dashboard';
+        if (window.location.pathname !== redirectPath) {
+          router.push(redirectPath);
+        }
+      }
+      
+      return true;
+    } catch (error) {
+      console.error('[Auth] Error handling session:', error);
+      setError(error instanceof Error ? error : new Error('Session handling failed'));
+      return false;
+    }
+  }, [getProfileAndSetUser, router]);
+
+  // Auth functions
+  const signIn = useCallback(async (email: string, password: string, rememberMe = true) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const { data, error } = await getSupabaseClient().auth.signInWithPassword({
+        email,
+        password,
+      });
+      
+      if (error || !data?.user) {
+        const err = error || new Error('No user returned');
+        setError(err);
+        console.error('Sign in error:', err.message);
+        return { error: err };
+      }
+      
+      await handleSession(data.session);
+      return { error: null };
+    } catch (error) {
+      console.error('Sign in error:', error);
+      const err = error instanceof Error ? error : new Error('Sign in failed');
+      setError(err);
+      return { error: err };
+    } finally {
+      setLoading(false);
+    }
+  }, [handleSession]);
+
+  const signUp = useCallback(async (email: string, password: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const { error } = await getSupabaseClient().auth.signUp({
+        email,
+        password,
+      });
+      
+      if (error) throw error;
+      return { error: null };
+    } catch (error) {
+      console.error('Sign up error:', error);
+      const err = error instanceof Error ? error : new Error('Sign up failed');
+      setError(err);
+      return { error: err };
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const signOut = useCallback(async () => {
+    try {
+      setLoading(true);
+      const { error } = await getSupabaseClient().auth.signOut();
+      if (error) throw error;
+      
+      setUser(null);
+      setSession(null);
+      router.push('/login');
+    } catch (error) {
+      console.error('Error signing out:', error);
+      setError(error instanceof Error ? error : new Error('Error signing out'));
+    } finally {
+      setLoading(false);
+    }
+  }, [router]);
+
+  const resetPassword = useCallback(async (email: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const { error } = await getSupabaseClient().auth.resetPasswordForEmail(email);
+      if (error) throw error;
+      return { error: null };
+    } catch (error) {
+      console.error('Password reset error:', error);
+      const err = error instanceof Error ? error : new Error('Password reset failed');
+      setError(err);
+      return { error: err };
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // Initialize auth state
+  useEffect(() => {
+    console.log('[Auth] Initializing auth context');
+    let isMounted = true;
+    
+    const initializeAuth = async () => {
+      try {
+        // Check for existing session
+        const { data: { session: currentSession }, error: sessionError } = await getSupabaseClient().auth.getSession();
+        
+        if (sessionError) throw sessionError;
+        
+        if (currentSession) {
+          console.log('[Auth] Found existing session');
+          await handleSession(currentSession);
+        } else {
+          console.log('[Auth] No existing session found');
+          setUser(null);
+          setSession(null);
+        }
+      } catch (error) {
+        console.error('[Auth] Error initializing auth:', error);
+        setError(error instanceof Error ? error : new Error('Auth initialization failed'));
+      } finally {
+        if (isMounted) setLoading(false);
+      }
+    };
+    
+    initializeAuth();
+    
+    // Set up auth state change listener
+    const { data: { subscription } } = getSupabaseClient().auth.onAuthStateChange(
+      async (event, session) => {
+        console.log('[Auth] Auth state changed:', { event });
+        if (session) {
+          await handleSession(session);
+        } else {
+          setUser(null);
+          setSession(null);
+        }
+      }
+    );
+    
+    return () => {
+      isMounted = false;
+      subscription?.unsubscribe();
+    };
+  }, [handleSession]);
+
+  const value = {
+    user,
+    session,
+    loading,
+    error,
+    signIn,
+    signUp,
+    signOut,
+    resetPassword,
+  };
+
+  return (
+    <AuthContext.Provider value={value}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export const useAuth = () => {
+  const context = useContext(AuthContext);
+  if (context === undefined) {
+    throw new Error('useAuth must be used within an AuthProvider');
+  }
+  return context;
+};
+    const handleSession = async (session: any): Promise<boolean> => {
+      console.log('[Auth] Verifying user with auth server...');
+      try {
+        const { data: { user }, error } = await getSupabaseClient().auth.getUser();
+        console.log('[Auth] User verification result:', { user: !!user, error });
+        
+        if (error) {
+          console.error('[Auth] Error getting user:', error);
+          throw error;
+        }
+        
+        // Only proceed with the session if the user is verified
+        if (user) {
+          await getProfileAndSetUser({ ...session, user });
+          return true;
+        } else {
+          console.log('[Auth] No user found for session, signing out...');
+          await getSupabaseClient().auth.signOut();
+          router.push('/login');
+          return false;
+        }
+      } catch (error) {
+        console.error('[Auth] Error in handleSession:', error);
+        throw error;
+      }
+    };
+
+    const initializeAuth = async (): Promise<void> => {
+      try {
+        console.log('[Auth] Starting auth initialization');
+        
+        // First try to get the user directly
+        try {
+          console.log('[Auth] Trying direct user fetch...');
+          const { data: { user }, error: userError } = await getSupabaseClient().auth.getUser();
+          
+          if (user && !userError) {
+            console.log('[Auth] Got user directly:', { 
+              id: user.id,
+              email: user.email,
+              role: user.role
+            });
+            
+            // If we have a user, try to get the session
+            const { data: { session } } = await getSupabaseClient().auth.getSession();
+            if (session) {
+              console.log('[Auth] Found session for user');
+              await handleSession(session);
+              return;
+            }
+          }
+          
+          console.log('[Auth] Falling back to session check...');
+          try {
+            const { data: { session }, error: sessionError } = await getSupabaseClient().auth.getSession();
+            
+            console.log('[Auth] Session result:', { 
+              hasSession: !!session, 
+              sessionId: session?.user?.id,
+              error: sessionError 
+            });
+            
+            if (session) {
+              await handleSession(session);
+            } else if (sessionError) {
+              console.error('[Auth] Error getting session:', sessionError);
+              throw sessionError;
+            }
+        } catch (error) {
+          console.warn('[Auth] Session check failed, checking for any existing session...', error);
+          // Last resort: try to get the current session again
+          const { data: { session } } = await getSupabaseClient().auth.getSession();
+          if (session?.user) {
+            console.log('[Auth] Found session in final attempt');
+            await handleSession(session);
+          }
+        }
+      } catch (error) {
+        console.error('Error initializing auth:', error);
+        setError(error instanceof Error ? error : new Error('Authentication error'));
+      } finally {
+        if (isMounted) setLoading(false);
+      }
+    };
+
+    console.log('[Auth] Starting auth initialization');
+    initializeAuth()
+      .then(() => console.log('[Auth] Auth initialization completed'))
+      .catch(error => {
+        console.error('[Auth] Error initializing auth:', error);
+        if (isMounted) {
+          setError(error instanceof Error ? error : new Error('Authentication error'));
+          setLoading(false);
+        }
+      });
+
+    // Listen for auth state changes
+    console.log('[Auth] Setting up auth state change listener');
+    let isHandlingAuthChange = false;
+    
+    const { data: { subscription } } = getSupabaseClient().auth.onAuthStateChange(
+      async (event, session) => {
+        // Prevent multiple simultaneous auth state change handlers
+        if (isHandlingAuthChange) {
+          console.log('[Auth] Already handling auth state change, skipping...');
+          return;
+        }
+        
+        isHandlingAuthChange = true;
+        console.log(`[Auth] Auth state changed: ${event}`, { event });
+        
+        try {
+          // Handle session changes
+          if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'USER_UPDATED') {
+            await handleSession(session);
+          } else if (event === 'SIGNED_OUT') {
+            setUser(null);
+            setSession(null);
+          }
+        } catch (error) {
+          console.error('Error handling auth state change:', error);
+          setError(error instanceof Error ? error : new Error('Error handling auth state change'));
+        } finally {
+          isHandlingAuthChange = false;
+        }
+      }
+    );
+
+    const signUp = async (email: string, password: string) => {
+      setLoading(true);
+      try {
+        const { error } = await getSupabaseClient().auth.signUp({
+          email,
+          password,
+          options: {
+            emailRedirectTo: `${window.location.origin}/auth/callback`,
+          },
+        });
+        if (error) {
+          console.error('Sign up error:', error.message);
+        }
+        return { error };
+      } catch (error) {
+        console.error('Error during sign up:', error);
+        return { error: error instanceof Error ? error : new Error('An unknown error occurred') };
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    const signOut = async () => {
+      setLoading(true);
+      try {
+        // Revoke backend session
+        await fetch('/api/session', { method: 'DELETE', credentials: 'include' });
+        // Supabase sign out
+        await getSupabaseClient().auth.signOut();
+        setUser(null);
+        setSession(null);
+        router.push('/login');
+      } catch (error) {
+        console.error('Error during sign out:', error);
+        throw error;
+      } finally {
+        setLoading(false);
+      }
+    };
+
+
+    const resetPassword = async (email: string) => {
+      setLoading(true);
+      try {
+        const { error } = await getSupabaseClient().auth.resetPasswordForEmail(email, {
+          redirectTo: `${window.location.origin}/update-password`,
+        });
+        if (error) {
+          console.error('Password reset error:', error.message);
+        }
+        return { error };
+      } catch (error) {
+        console.error('Error during password reset:', error);
+        return { error: error instanceof Error ? error : new Error('An unknown error occurred') };
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    // Set up auth state change listener
+    const { data: { subscription } } = getSupabaseClient().auth.onAuthStateChange(
+      async (event, session) => {
+        console.log('[Auth] Auth state changed:', { event, session: !!session });
+        if (session) {
+          await handleSession(session);
+        } else {
+          setUser(null);
+          setSession(null);
+        }
+      }
+    );
+
+    // Initial auth check
+    initializeAuth();
+
+    // Cleanup function
+    return () => {
+      isMounted = false;
+      subscription?.unsubscribe();
+    };
+  }, [router]);
+
+  // Return the Auth Provider
+  return (
+    <AuthContext.Provider
+      value={{
+        user,
+        session,
+        loading,
+        error,
+        signIn,
+        signUp,
+        signOut,
+        resetPassword,
+      }}
+    >
+      {children}
+    </AuthContext.Provider>
+  );
+
+  const signIn = async (email: string, password: string, rememberMe: boolean = true) => {
+    setLoading(true);
+    setError(null);
+    try {
+      // Supabase Auth login
+      const { data, error } = await getSupabaseClient().auth.signInWithPassword({
+        email,
+        password,
+      });
+      if (error || !data?.user) {
+        setError(error || new Error('No user returned'));
+        console.error('Sign in error:', error?.message);
+        return { error: error || new Error('No user returned') };
+      }
+      // Call backend session API to create a session
+      const sessionRes = await fetch('/api/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_id: data.user.id,
+          persistent: rememberMe
+        }),
+      });
+      if (!sessionRes.ok) {
+        const { error: sessionError } = await sessionRes.json();
+        setError(new Error(sessionError || 'Session creation failed'));
+        return { error: new Error(sessionError || 'Session creation failed') };
+      }
+      return { error: null };
+    } catch (error) {
+      setError(error instanceof Error ? error : new Error('An unknown error occurred'));
+      console.error('Error during sign in:', error);
+      return { error: error instanceof Error ? error : new Error('An unknown error occurred') };
+    } finally {
+      setLoading(false);
+    }
+  };
+
+
+  const signUp = async (email: string, password: string) => {
+    setLoading(true);
+    try {
+      const { error } = await getSupabaseClient().auth.signUp({
+        email,
+        password,
+        options: {
+          emailRedirectTo: `${window.location.origin}/auth/callback`,
+        },
+      });
+      if (error) {
+        console.error('Sign up error:', error.message);
+      }
+      return { error };
+    } catch (error) {
+      console.error('Error during sign up:', error);
+      return { error: error instanceof Error ? error : new Error('An unknown error occurred') };
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const signOut = async () => {
+    setLoading(true);
+    try {
+      // Revoke backend session
+      await fetch('/api/session', { method: 'DELETE', credentials: 'include' });
+      // Supabase sign out
+      await getSupabaseClient().auth.signOut();
+      setUser(null);
+      setSession(null);
+      router.push('/login');
+    } catch (error) {
+      console.error('Error during sign out:', error);
+      throw error;
+    } finally {
+      setLoading(false);
+    }
+  };
+
+
+  const resetPassword = async (email: string) => {
+    setLoading(true);
+    try {
+      const { error } = await getSupabaseClient().auth.resetPasswordForEmail(email, {
+        redirectTo: `${window.location.origin}/update-password`,
+      });
+      if (error) {
+        console.error('Password reset error:', error.message);
+      }
+      return { error };
+    } catch (error) {
+      console.error('Error during password reset:', error);
+      return { error: error instanceof Error ? error : new Error('An unknown error occurred') };
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <AuthContext.Provider
+      value={{
+        user,
+        session,
+        loading,
+        error,
+        signIn,
+        signUp,
+        signOut,
+        resetPassword,
+      }}
+    >
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export const useAuth = () => {
+  const context = useContext(AuthContext);
+  if (context === undefined) {
+    throw new Error('useAuth must be used within an AuthProvider');
+  }
+  return context;
+};
