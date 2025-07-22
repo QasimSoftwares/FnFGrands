@@ -24,18 +24,131 @@ import Image from 'next/image';
 import { RoleSwitcher } from '@/components/role-switcher';
 
 export default function DashboardPage() {
-  const { user, loading, signOut, currentRole, switchRole } = useAuth();
+  const { 
+    user, 
+    loading, 
+    signOut, 
+    currentRole, 
+    setCurrentRole, 
+    switchRole 
+  } = useAuth();
   const { grants } = useGrants();
   const router = useRouter();
   const [searchQuery, setSearchQuery] = useState('');
+  
+  // Debug log when component renders
+  useEffect(() => {
+    console.log('Dashboard rendered with role:', currentRole);
+    console.log('User roles:', user?.roles);
+  }, [currentRole, user?.roles]);
 
-  // Handle role switching
-  const handleRoleChange = async (role: string) => {
-    await switchRole(role as any);
-    // Force a refresh to ensure the UI updates
-    router.refresh();
+  // Handle role switching with proper error handling and UI feedback
+  const handleRoleChange = async (newRole: UserRole) => {
+    console.log('Role change requested:', newRole);
+    
+    // Prevent unnecessary role switches
+    if (currentRole === newRole) {
+      console.log('Already in the requested role, no change needed');
+      return;
+    }
+    
+    // Show loading state if needed
+    const originalRole = currentRole;
+    try {
+      console.log('Initiating role switch to:', newRole);
+      
+      // Update the UI optimistically
+      setCurrentRole(newRole);
+      
+      // Attempt to switch the role
+      const success = await switchRole(newRole);
+      
+      if (success) {
+        console.log('Role changed successfully, updating UI...');
+        
+        // Reset any search or filter state that might be role-specific
+        setSearchQuery('');
+        
+        // Only reload if absolutely necessary (e.g., for Clerk dashboard redirect)
+        if (newRole === 'clerk') {
+          window.location.href = '/clerk-dashboard';
+        }
+      } else {
+        console.error('Role switch failed - user might not have the requested role');
+        // Revert to original role in UI if switch failed
+        setCurrentRole(originalRole);
+      }
+    } catch (error) {
+      console.error('Error during role switch:', error);
+      // Revert to original role in case of error
+      setCurrentRole(originalRole);
+      
+      // Optionally show an error message to the user
+      // You could use a toast notification here
+    }
   };
   
+  // Effect to handle role changes and redirects
+  useEffect(() => {
+    if (!loading && currentRole === 'clerk') {
+      router.push('/clerk-dashboard');
+      return;
+    }
+  }, [currentRole, loading, router]);
+  
+  // Role-specific content
+  const renderRoleSpecificContent = () => {
+    if (!currentRole) return null;
+    
+    // Define role content with all possible UserRole values
+    type RoleContent = {
+      [key in UserRole]?: React.ReactNode;
+    };
+    
+    const roleContent: RoleContent = {
+      admin: (
+        <div className="bg-blue-50 p-4 rounded-lg border border-blue-200 mb-6">
+          <h3 className="text-lg font-semibold text-blue-800">Admin Dashboard</h3>
+          <p className="text-blue-700">You have full administrative access to all features.</p>
+          <ul className="list-disc pl-5 mt-2 text-blue-600">
+            <li>Manage all grants</li>
+            <li>View all user activities</li>
+            <li>Configure system settings</li>
+          </ul>
+        </div>
+      ),
+      viewer: (
+        <div className="bg-green-50 p-4 rounded-lg border border-green-200 mb-6">
+          <h3 className="text-lg font-semibold text-green-800">Viewer Dashboard</h3>
+          <p className="text-green-700">You have read-only access to grants.</p>
+          <ul className="list-disc pl-5 mt-2 text-green-600">
+            <li>View all grants</li>
+            <li>Search and filter grants</li>
+            <li>Export grant data</li>
+          </ul>
+        </div>
+      ),
+      clerk: (
+        <div className="bg-purple-50 p-4 rounded-lg border border-purple-200 mb-6">
+          <h3 className="text-lg font-semibold text-purple-800">Clerk Dashboard</h3>
+          <p className="text-purple-700">You can manage grant applications and basic operations.</p>
+          <ul className="list-disc pl-5 mt-2 text-purple-600">
+            <li>Process grant applications</li>
+            <li>Update grant status</li>
+            <li>Generate reports</li>
+          </ul>
+        </div>
+      ),
+    };
+
+    return roleContent[currentRole] || (
+      <div className="bg-yellow-50 p-4 rounded-lg border border-yellow-200 mb-6">
+        <h3 className="text-lg font-semibold text-yellow-800">Welcome to Your Dashboard</h3>
+        <p className="text-yellow-700">Your current role is: {currentRole}</p>
+      </div>
+    );
+  };
+
   // Filter grants based on search query
   const filteredGrants = searchQuery
     ? grants.filter(grant => 
@@ -46,14 +159,10 @@ export default function DashboardPage() {
     : grants;
 
   useEffect(() => {
-    if (!loading) {
-      if (!user) {
-        router.replace('/login');
-      } else if (currentRole === 'clerk') {
-        router.replace('/clerk-dashboard');
-      }
+    if (!loading && !user) {
+      router.replace('/login');
     }
-  }, [user, loading, router, currentRole]);
+  }, [user, loading, router]);
 
   // If no role is set yet, show loading
   if (loading || !currentRole) {
@@ -79,11 +188,16 @@ export default function DashboardPage() {
   const displayName = typeof user.full_name === 'string' && user.full_name.trim() !== ''
     ? user.full_name
     : user.email;
-  const role = user.role;
+  const role = currentRole || user.role;
 
-  // --- Admin Recent Activity Logic ---
+  // Role-specific content
+  const roleContent = renderRoleSpecificContent();
+
+  // --- Role-based content logic ---
   let recentGrants: typeof grants = [];
   let upcomingDeadlines: typeof grants = [];
+  
+  // Admin-specific logic
   if (role === 'admin') {
     const now = new Date();
     // Grants added by this admin in last 24h
@@ -107,6 +221,7 @@ export default function DashboardPage() {
                 src="/images/logo.png" 
                 alt="Family and Fellows Foundation Logo" 
                 fill 
+                sizes="(max-width: 768px) 40px, 40px"
                 className="object-contain"
               />
             </div>
@@ -133,28 +248,44 @@ export default function DashboardPage() {
         <div className="max-w-7xl mx-auto bg-white rounded-lg shadow p-6">
           {/* Search and Welcome Section */}
           <div className="mb-8">
-            <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-6">
+            {/* Role-specific content */}
+            {renderRoleSpecificContent()}
+            
+            <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-6 mt-6">
               <div>
-                <h1 className="text-2xl font-bold text-gray-800">
-                  Welcome, {displayName}!
-                </h1>
+                <div className="flex items-center gap-3 mb-1">
+                  <h1 className="text-2xl font-bold text-gray-800">
+                    Welcome, {displayName}!
+                  </h1>
+                  <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium 
+                    ${role === 'admin' ? 'bg-blue-100 text-blue-800' : 
+                      role === 'viewer' ? 'bg-green-100 text-green-800' : 
+                      role === 'clerk' ? 'bg-purple-100 text-purple-800' :
+                      'bg-gray-100 text-gray-800'}`}>
+                    {role?.toUpperCase()}
+                  </span>
+                </div>
                 <p className="text-gray-600">
                   {role === 'admin'
-                    ? 'You are signed in as an admin. Use the buttons below to manage grants or review recent activity.'
-                    : 'You have successfully logged in to the Family and Fellows Foundation Grant Tracker.'}
+                    ? 'You have full administrative access to all features.'
+                    : role === 'viewer'
+                    ? 'You have read-only access to view grants and reports.'
+                    : role === 'clerk'
+                    ? 'You can manage grant applications and basic operations.'
+                    : 'You are logged in to the Family and Fellows Foundation Grant Tracker.'}
                 </p>
-              </div>
               
-              {/* Search Bar */}
-              <div className="relative w-full md:w-96">
-                <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
-                <Input
-                  type="text"
-                  placeholder="Search grants..."
-                  className="pl-10 w-full"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                />
+                {/* Search Bar */}
+                <div className="relative w-full md:w-96">
+                  <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+                  <Input
+                    type="text"
+                    placeholder="Search grants..."
+                    className="pl-10 w-full"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                  />
+                </div>
               </div>
             </div>
           </div>

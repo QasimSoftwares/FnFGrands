@@ -1,8 +1,27 @@
 import { createBrowserClient } from '@supabase/ssr'
 import { Database } from '@/types/supabase'
 
+// Helper to safely access localStorage
+const getLocalStorage = (): Storage => {
+  if (typeof window === 'undefined') {
+    // Return a mock localStorage for server-side
+    return {
+      getItem: () => null,
+      setItem: () => {},
+      removeItem: () => {},
+      clear: () => {},
+      key: () => null,
+      length: 0
+    } as Storage;
+  }
+  return window.localStorage;
+};
+
 // Create a single supabase client for interacting with your database
-export function createClientClient(storage: Storage = localStorage, persistSession: boolean = true) {
+export function createClientClient(storage?: Storage, persistSession: boolean = true) {
+  // Use provided storage or default to safe localStorage accessor
+  const safeStorage = storage || getLocalStorage();
+  
   // Debug: Log available environment variables
   console.log('Available environment variables:', {
     NEXT_PUBLIC_SUPABASE_URL: process.env.NEXT_PUBLIC_SUPABASE_URL ? 'set' : 'missing',
