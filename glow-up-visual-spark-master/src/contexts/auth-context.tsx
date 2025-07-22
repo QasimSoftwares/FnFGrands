@@ -68,16 +68,16 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     try {
       const supabase = getSupabaseClient();
 
-      // Try to get the user's profile
+      // Try to get the user's profile (only basic info, roles are handled separately)
       const { data: profile, error: profileError } = await supabase
         .from('profiles')
-        .select('full_name')
+        .select('full_name, avatar_url')
         .eq('id', session.user.id)
         .single();
 
+      // Don't throw if profile doesn't exist, we'll create it with default values
       if (profileError && profileError.code !== 'PGRST116') { // PGRST116 = no rows returned
-        console.error('Profile fetch error:', profileError);
-        throw profileError;
+        console.error('Profile fetch error (non-fatal):', profileError);
       }
 
       // Fetch user roles using the denormalized table
@@ -130,10 +130,26 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
         console.error('Exception when fetching roles:', err);
       }
 
+      // Get user's display name from various sources
       const full_name = profile?.full_name || 
                        session.user.user_metadata?.full_name || 
                        session.user.email?.split('@')[0] || 
                        'User';
+      
+      // Ensure we have a profile record
+      if (!profile) {
+        const { error: createError } = await supabase
+          .from('profiles')
+          .insert([{ 
+            id: session.user.id,
+            full_name,
+            avatar_url: session.user.user_metadata?.avatar_url || null
+          }]);
+          
+        if (createError) {
+          console.error('Error creating profile:', createError);
+        }
+      }
 
       if (isMounted.current) {
         const userRoles: UserRole[] = (roles.length > 0 ? roles : ['viewer']) as UserRole[];
@@ -243,11 +259,18 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
 
       // Check if this is the first user
       const { count: userCount, error: countError } = await supabase
-        .from('profiles')
+        .from('user_roles_denorm')
         .select('*', { count: 'exact', head: true });
 
-      if (countError) throw countError;
+      if (countError) {
+        console.error('Error checking user count:', countError);
+        throw new Error('Failed to check existing users');
+      }
+
       const isFirstUser = userCount === 0;
+      // Only assign admin to the first user, others get viewer by default
+      const rolesToAssign = isFirstUser ? ['admin', 'viewer'] : ['viewer'];
+      console.log(`Assigning roles to new user: ${rolesToAssign.join(', ')}`);
 
       // 1. Create the auth user
       const { data: authData, error: signUpError } = await supabase.auth.signUp({
@@ -286,14 +309,17 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
       }
       
       // 3. Assign role(s)
-      const rolesToAssign = isFirstUser ? ['admin', 'viewer'] : ['viewer'];
-      
-      console.log(`Assigning roles to user ${authData.user.id}:`, rolesToAssign);
-      
-      const { error: roleError } = await supabase.rpc('assign_roles_to_user', {
-        p_user_id: authData.user.id,
-        p_roles: rolesToAssign
-      });
+      // Insert roles directly into user_roles_denorm
+      const { error: roleError } = await supabase
+        .from('user_roles_denorm')
+        .insert([{
+          user_id: authData.user.id,
+          is_admin: isFirstUser,  // Only true for first user
+          is_viewer: true,        // Always true for all users
+          is_clerk: false,
+          is_donor: false,
+          is_member: false
+        }]);
 
       if (roleError) {
         console.error('Role assignment error:', roleError);
