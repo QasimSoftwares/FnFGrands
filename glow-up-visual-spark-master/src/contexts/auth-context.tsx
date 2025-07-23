@@ -29,6 +29,7 @@ interface SignUpResult {
 interface AuthContextType {
   user: AppUser | null;
   session: Session | null;
+  supabase: ReturnType<typeof getSupabaseClient>;
   loading: boolean;
   error: Error | null;
   currentRole: UserRole | null;
@@ -54,8 +55,24 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   const isMounted = useRef(true);
   const router = useRouter();
 
+  // Helper function to safely get roles from record
+  const getRolesFromRecordSafe = (record: any): UserRole[] => {
+    if (!record) return ['viewer'];
+    
+    const roles: UserRole[] = [];
+    if (record.is_admin) roles.push('admin');
+    if (record.is_viewer) roles.push('viewer');
+    if (record.is_clerk) roles.push('clerk');
+    if (record.is_donor) roles.push('donor');
+    if (record.is_member) roles.push('member');
+    
+    return roles.length > 0 ? roles : ['viewer'];
+  };
+
   // Fetch profile and roles with better error handling and retries
   const getProfileAndSetUser = useCallback(async (session: Session | null, attempt = 1) => {
+    if (!isMounted.current) return;
+    
     if (!session?.user) {
       if (isMounted.current) {
         setUser(null);
@@ -67,6 +84,9 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
 
     try {
       const supabase = getSupabaseClient();
+      if (!supabase) {
+        throw new Error('Supabase client not available');
+      }
 
       // Try to get the user's profile (only basic info, roles are handled separately)
       const { data: profile, error: profileError } = await supabase
@@ -113,18 +133,8 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
             }
           }
         } else if (rolesRecord) {
-          // Convert the roles record to an array of role strings
-          roles = [];
-          if (rolesRecord.is_admin) roles.push('admin');
-          if (rolesRecord.is_viewer) roles.push('viewer');
-          if (rolesRecord.is_clerk) roles.push('clerk');
-          if (rolesRecord.is_donor) roles.push('donor');
-          if (rolesRecord.is_member) roles.push('member');
-          
-          if (roles.length === 0) {
-            console.log('No roles enabled, defaulting to viewer');
-            roles = ['viewer'];
-          }
+          // Use the safe function to get roles
+          roles = getRolesFromRecordSafe(rolesRecord);
         }
       } catch (err) {
         console.error('Exception when fetching roles:', err);
@@ -204,23 +214,6 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     }
   }, [getProfileAndSetUser, router]);
 
-  useEffect(() => {
-    const supabase = getSupabaseClient();
-
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      handleAuthStateChange('INITIAL_SESSION', session);
-    });
-
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
-      handleAuthStateChange(event, session);
-    });
-
-    return () => {
-      isMounted.current = false;
-      subscription?.unsubscribe();
-    };
-  }, [handleAuthStateChange]);
-
   const signIn = async (email: string, password: string, rememberMe = true) => {
     setLoading(true);
     try {
@@ -243,7 +236,7 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     }
   };
 
-  const signUp = async (email: string, password: string, fullName?: string) => {
+  const signUp = useCallback(async (email: string, password: string, fullName?: string, initialRoles?: UserRole[]) => {
     setLoading(true);
     try {
       const supabase = getSupabaseClient();
@@ -273,7 +266,7 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
       console.log(`Assigning roles to new user: ${rolesToAssign.join(', ')}`);
 
       // 1. Create the auth user
-      const { data: authData, error: signUpError } = await supabase.auth.signUp({
+      const { data, error } = await supabase.auth.signUp({
         email,
         password,
         options: {
@@ -284,20 +277,20 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
         }
       });
 
-      if (signUpError) {
-        if (signUpError.message.includes('already registered')) {
+      if (error) {
+        if (error.message.includes('already registered')) {
           throw new Error('This email is already registered. Please sign in instead.');
         }
-        throw signUpError;
+        throw error;
       }
 
-      if (!authData.user) throw new Error('User creation failed');
+      if (!data.user) throw new Error('User creation failed');
 
       // 2. Create user profile
       const { error: profileError } = await supabase
         .from('profiles')
         .upsert({
-          id: authData.user.id,
+          id: data.user.id,
           email: email,
           full_name: fullName || email.split('@')[0],
           updated_at: new Date().toISOString()
@@ -310,26 +303,33 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
       
       // 3. Assign role(s)
       // Insert roles directly into user_roles_denorm
-      const { error: roleError } = await supabase
-        .from('user_roles_denorm')
-        .insert([{
-          user_id: authData.user.id,
-          is_admin: isFirstUser,  // Only true for first user
-          is_viewer: true,        // Always true for all users
-          is_clerk: false,
-          is_donor: false,
-          is_member: false
-        }]);
+      const { error: rolesError } = await supabase.rpc('assign_roles_to_user', {
+        p_user_id: data.user.id,
+        p_roles: rolesToAssign
+      });
 
-      if (roleError) {
-        console.error('Role assignment error:', roleError);
-        throw roleError;
+      if (rolesError) {
+        console.error('Error assigning roles:', rolesError);
+        throw new Error('Failed to assign user roles');
+      }
+
+      // 4. If this is the first user (admin), create an organization for them
+      if (isFirstUser) {
+        const orgName = fullName ? `${fullName}'s Organization` : `${email.split('@')[0]}'s Organization`;
+        const orgId = await createOrganizationForAdmin(data.user.id, orgName);
+        
+        if (!orgId) {
+          console.error('Failed to create organization for admin user');
+          // Continue anyway, the user can create an org later
+        } else {
+          console.log(`Created organization ${orgId} for admin user ${data.user.id}`);
+        }
       }
 
       console.log(`User ${email} created successfully with roles: ${rolesToAssign.join(', ')}`);
       return { 
         error: null,
-        user: authData.user,
+        user: data.user,
         isFirstUser
       };
     } catch (err) {
@@ -342,7 +342,39 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
+
+  // Helper function to create organization for admin users
+  const createOrganizationForAdmin = useCallback(async (userId: string, organizationName?: string) => {
+    if (!supabase) return null;
+    
+    try {
+      // Create a new organization
+      const { data: orgData, error: orgError } = await supabase
+        .from('organizations')
+        .insert([{ 
+          name: organizationName || `${userId}'s Organization`,
+          created_by: userId 
+        }])
+        .select()
+        .single();
+
+      if (orgError) throw orgError;
+
+      // Update user's profile with the new organization ID
+      const { error: profileError } = await supabase
+        .from('profiles')
+        .update({ organization_id: orgData.id })
+        .eq('id', userId);
+
+      if (profileError) throw profileError;
+
+      return orgData.id;
+    } catch (error) {
+      console.error('Error creating organization for admin:', error);
+      return null;
+    }
+  }, [supabase]);
 
   const signOut = async () => {
     setLoading(true);
@@ -399,8 +431,16 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
 
   // Role helper methods
   const hasRole = useCallback((role: UserRole): boolean => {
-    if (!user?.rolesRecord) return false;
-    return user.rolesRecord[`is_${role}` as keyof UserRolesRecord] === true;
+    // First check the roles array (preferred)
+    if (user?.roles?.includes(role)) return true;
+    
+    // Fall back to rolesRecord for backward compatibility
+    if (user?.rolesRecord) {
+      const roleKey = `is_${role}` as keyof UserRolesRecord;
+      return user.rolesRecord[roleKey] === true;
+    }
+    
+    return false;
   }, [user]);
 
   const hasAnyRole = useCallback((roles: UserRole[]): boolean => {
@@ -420,6 +460,7 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     // If we have a rolesRecord, extract the roles from it
     let roles: UserRole[] = [];
     if (rolesRecord) {
+      console.log('Updating user roles from record:', rolesRecord);
       if (rolesRecord.is_admin) roles.push('admin');
       if (rolesRecord.is_viewer) roles.push('viewer');
       if (rolesRecord.is_clerk) roles.push('clerk');
@@ -427,11 +468,13 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
       if (rolesRecord.is_member) roles.push('member');
     } else if (userData.roles) {
       // Fall back to existing roles if no record provided
+      console.log('Using existing user roles:', userData.roles);
       roles = [...userData.roles];
     }
     
     // Ensure we always have at least the viewer role
     if (roles.length === 0) {
+      console.log('No roles found, assigning default viewer role');
       roles = ['viewer'];
     }
     
@@ -439,6 +482,8 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     const currentRole = userData.role && roles.includes(userData.role) 
       ? userData.role 
       : roles[0];
+    
+    console.log('Final user roles:', roles, 'Current role:', currentRole);
     
     return {
       ...userData,
@@ -535,18 +580,95 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     }
   }, [fetchUserAndRoles, updateUserWithRoles]);
 
+  // Helper function to ensure a user has an organization
+  const ensureUserHasOrganization = async (userId: string, email: string, fullName?: string) => {
+    if (!supabase) return null;
+    
+    try {
+      // Check if user already has an organization
+      const { data: profile, error: profileError } = await supabase
+        .from('profiles')
+        .select('organization_id')
+        .eq('id', userId)
+        .single();
+
+      if (profileError) throw profileError;
+      
+      // If user already has an organization, return it
+      if (profile?.organization_id) {
+        return profile.organization_id;
+      }
+      
+      // Get Qasim's organization ID (Qasim's user ID: 51c8633a-a435-4d46-98cc-dc9cb76b0db7)
+      const { data: qasimProfile, error: qasimError } = await supabase
+        .from('profiles')
+        .select('organization_id')
+        .eq('id', '51c8633a-a435-4d46-98cc-dc9cb76b0db7')
+        .single();
+      
+      // If we found Qasim's organization, use it
+      if (qasimProfile?.organization_id && !qasimError) {
+        // Update user's profile with Qasim's organization ID
+        const { error: updateError } = await supabase
+          .from('profiles')
+          .update({ organization_id: qasimProfile.organization_id })
+          .eq('id', userId);
+          
+        if (updateError) throw updateError;
+        
+        console.log(`Assigned Qasim's organization to user ${userId}`);
+        return qasimProfile.organization_id;
+      }
+      
+      // Fallback: Create a new organization if Qasim's org isn't found
+      const orgName = fullName ? `${fullName}'s Organization` : `${email.split('@')[0]}'s Organization`;
+      const { data: orgData, error: orgError } = await supabase
+        .from('organizations')
+        .insert([{ 
+          name: orgName,
+          created_by: userId,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        }])
+        .select('id')
+        .single();
+        
+      if (orgError) throw orgError;
+      
+      // Update user's profile with the new organization ID
+      const { error: updateError } = await supabase
+        .from('profiles')
+        .update({ organization_id: orgData.id })
+        .eq('id', userId);
+        
+      if (updateError) throw updateError;
+      
+      return orgData.id;
+    } catch (error) {
+      console.error('Error ensuring user has organization:', error);
+      return null;
+    }
+  };
+
   // Update signUp to use the new roles structure
   const signUpWithRoles = useCallback(async (email: string, password: string, fullName?: string, initialRoles: UserRole[] = ['viewer']) => {
+    if (!supabase) {
+      setError(new Error('Database connection error'));
+      return { error: new Error('Database connection error'), user: null, isFirstUser: false };
+    }
+    
     setLoading(true);
     setError(null);
     
     try {
       // Check if this is the first user (will be admin)
-      const { count } = await supabase
+      const { count: userCount, error: countError } = await supabase
         .from('user_roles_denorm')
         .select('*', { count: 'exact', head: true });
       
-      const isFirstUser = count === 0;
+      if (countError) throw countError;
+      
+      const isFirstUser = userCount === 0;
       
       // If first user, add admin role
       if (isFirstUser) {
@@ -612,8 +734,8 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   const switchRole = useCallback(async (role: UserRole): Promise<boolean> => {
     console.log('Switching to role:', role);
     
-    if (!user) {
-      console.error('No user logged in');
+    if (!user || !supabase) {
+      console.error('No user logged in or database connection error');
       return false;
     }
     
@@ -627,63 +749,115 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     try {
       console.log('Setting current role in state and localStorage to:', role);
       
-      // Update the current role in state
-      setCurrentRole(role);
-      
-      // Persist the role in localStorage
-      if (typeof window !== 'undefined') {
-        localStorage.setItem('currentRole', role);
+      // If switching to admin role and user doesn't have an organization, create one
+      if (role === 'admin') {
+        await ensureUserHasOrganization(user.id, user.email || 'user@example.com', user.full_name);
       }
       
-      // Force a refresh of the user data to ensure UI updates
-      try {
-        const { data: rolesRecord, error } = await supabase
-          .from('user_roles_denorm')
-          .select('*')
-          .eq('user_id', user.id)
-          .single();
-          
-        if (error) {
-          console.error('Error refreshing user roles:', error);
-          return false;
-        } else if (rolesRecord) {
-          // Update the user with the latest roles
-          const updatedUser = updateUserWithRoles(user, rolesRecord);
-          if (updatedUser) {
-            console.log('Updated user with roles:', updatedUser.roles);
-            setUser(updatedUser);
-            return true;
-          }
-        }
-      } catch (err) {
-        console.error('Error refreshing user data:', err);
-        return false;
+      // Update the current role in state and localStorage
+      setCurrentRole(role);
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('currentRole', role);
       }
       
       return true;
     } catch (error) {
       console.error('Error switching role:', error);
       return false;
+    } finally {
+      setLoading(false);
     }
-  }, [user, updateUserWithRoles, supabase]);
+  }, [user, supabase, createOrganizationForAdmin]);
+
+  // Set up auth state subscription
+  useEffect(() => {
+    // Set initial loading state
+    setLoading(true);
+    
+    // Check for active session
+    const supabase = getSupabaseClient();
+    if (!supabase) {
+      console.error('Supabase client not available');
+      setLoading(false);
+      return;
+    }
+    
+    let mounted = true;
+    let authSubscription: { subscription: { unsubscribe: () => void } } | null = null;
+    
+    const initializeAuth = async () => {
+      try {
+        // Get initial session
+        const { data: { session } } = await supabase.auth.getSession();
+        
+        if (mounted) {
+          if (session) {
+            await getProfileAndSetUser(session);
+          } else {
+            setLoading(false);
+          }
+        }
+        
+        // Set up auth state change listener
+        const { data: subscriptionData } = supabase.auth.onAuthStateChange(
+          async (event, session) => {
+            if (mounted) {
+              if (event === 'SIGNED_OUT') {
+                setUser(null);
+                setSession(null);
+                setCurrentRole(null);
+                router.push('/login');
+              } else if (event === 'SIGNED_IN' || event === 'INITIAL_SESSION') {
+                if (session) {
+                  await getProfileAndSetUser(session);
+                }
+              }
+            }
+          }
+        );
+        
+        if (subscriptionData) {
+          authSubscription = subscriptionData;
+        }
+      } catch (error) {
+        console.error('Error initializing auth:', error);
+        if (mounted) {
+          setLoading(false);
+        }
+      }
+    };
+    
+    initializeAuth();
+    
+    // Cleanup function
+    return () => {
+      mounted = false;
+      if (authSubscription?.subscription) {
+        authSubscription.subscription.unsubscribe();
+      }
+    };
+  }, [getProfileAndSetUser, router]);
 
   return (
-    <AuthContext.Provider value={{
-      user,
-      session,
-      loading,
-      error,
-      currentRole,
-      setCurrentRole, // Add setCurrentRole to the context value
-      signIn: signInWithRoles,
-      signUp: signUpWithRoles,
-      signOut: handleSignOut,
-      resetPassword,
-      switchRole,
-      hasRole,
-      hasAnyRole,
-      hasAllRoles,
-    }}>
+    <AuthContext.Provider
+      value={{
+        user,
+        session,
+        supabase,
+        loading,
+        error,
+        currentRole,
+        setCurrentRole,
+        signIn: signInWithRoles,
+        signUp: signUpWithRoles,
+        signOut: handleSignOut,
+        resetPassword,
+        switchRole,
+        hasRole,
+        hasAnyRole,
+        hasAllRoles,
+      }}
+    >
       {children}
     </AuthContext.Provider>
   );

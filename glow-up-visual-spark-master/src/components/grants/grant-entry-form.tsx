@@ -192,7 +192,17 @@ export const GrantEntryForm = ({ grant, onSuccess, onCancel }: GrantEntryFormPro
         toast.success('Grant created successfully');
       }
       
-      onSuccess?.() || router.push('/grants');
+      // Reset form after successful submission
+      reset();
+      
+      // If onSuccess callback is provided, call it, otherwise redirect
+      if (onSuccess) {
+        onSuccess();
+      } else {
+        router.push('/grants');
+        // Force a reload to ensure fresh data
+        router.refresh();
+      }
     } catch (error) {
       console.error('Error saving grant:', error);
       toast.error(
@@ -200,6 +210,8 @@ export const GrantEntryForm = ({ grant, onSuccess, onCancel }: GrantEntryFormPro
           ? `Error: ${error.message}`
           : 'There was an error saving the grant. Please try again.'
       );
+      // Re-throw the error to be caught by react-hook-form
+      throw error;
     } finally {
       setIsSubmitting(false);
     }

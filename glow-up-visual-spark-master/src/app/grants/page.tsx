@@ -55,16 +55,28 @@ export default function GrantsPage() {
   const filteredGrants = grants
     .filter((grant: Grant): grant is Required<Grant> => {
       if (!grant) return false;
+      
+      // Apply search term filter
       const searchLower = searchTerm.toLowerCase();
-      const matchesName = grant.name?.toLowerCase().includes(searchLower) ?? false;
+      const matchesSearch = 
+        (grant.name?.toLowerCase().includes(searchLower) ||
+         grant.donor?.toLowerCase().includes(searchLower) ||
+         grant.id?.toLowerCase().includes(searchLower)) ?? false;
+      
+      // Apply additional filters
       const matchesGrantId = filters.grantId ? grant.id?.toLowerCase().includes(filters.grantId.toLowerCase()) : true;
       const matchesDonor = filters.donor ? grant.donor?.toLowerCase().includes(filters.donor.toLowerCase()) : true;
       const matchesStatus = !filters.status || grant.status === filters.status;
+      
+      // Handle date filters
       const appliedDate = grant.applied_date ? new Date(grant.applied_date) : undefined;
-      const matchesAppliedFrom = filters.appliedFrom && appliedDate ? appliedDate >= new Date(filters.appliedFrom) : true;
-      const matchesAppliedTo = filters.appliedTo && appliedDate ? appliedDate <= new Date(filters.appliedTo) : true;
+      const matchesAppliedFrom = filters.appliedFrom && appliedDate ? 
+        appliedDate >= new Date(filters.appliedFrom + 'T00:00:00') : true;
+      const matchesAppliedTo = filters.appliedTo && appliedDate ? 
+        appliedDate <= new Date(filters.appliedTo + 'T23:59:59') : true;
+      
       return (
-        matchesName &&
+        matchesSearch &&
         matchesGrantId &&
         matchesDonor &&
         matchesStatus &&

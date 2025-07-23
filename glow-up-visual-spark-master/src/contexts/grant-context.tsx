@@ -1,239 +1,281 @@
-'use client'
+'use client';
 
-import React, { createContext, useContext, useEffect, useState, useCallback } from 'react'
-import { useAuth } from './auth-context'
-import { Grant, UserRole, GrantStatus } from '@/types'
-import { getSupabaseClient } from '@/lib/supabase/client';
-import { mapDbGrantToGrant, mapGrantToDbGrant } from '@/lib/supabase/types'
-import { toast } from 'sonner'
+import {
+  createContext,
+  useContext,
+  useState,
+  useCallback,
+  useMemo,
+  ReactNode,
+  useEffect,
+} from 'react';
+import { v4 as uuidv4 } from 'uuid';
+import { toast } from 'sonner';
+import { useAuth } from './auth-context';
+import { PostgrestError } from '@supabase/supabase-js';
+
+type GrantStatus = 'draft' | 'applied' | 'awarded' | 'rejected' | 'pending';
+
+type GrantBase = {
+  id: string;
+  name: string;
+  donor: string;
+  type: string;
+  category: string;
+  amount: number;
+  status: GrantStatus;
+  applied_date: string | null;
+  deadline: string | null;
+  last_follow_up: string | null;
+  next_follow_up: string | null;
+  amount_awarded: number | null;
+  outcome_summary: string | null;
+  responsible_person: string | null;
+  progress_notes: string | null;
+  user_id: string;
+  created_at: string;
+  updated_at: string;
+  created_by: string;
+  updated_by: string;
+  deleted_at: string | null;
+  organization_id: string | null;
+};
+
+type Grant = GrantBase;
+
+type GrantInsert = Omit<GrantBase, 
+  'id' | 'created_at' | 'updated_at' | 'deleted_at' | 'created_by' | 'updated_by' | 'user_id'
+> & {
+  id?: string;
+  user_id?: string;
+};
+
+type GrantUpdate = Partial<Omit<GrantBase, 'id'>> & { id: string };
 
 type GrantContextType = {
-  grants: Grant[]
-  loading: boolean
-  error: string | null
-  addGrant: (grant: Omit<Grant, 'id' | 'created_at' | 'updated_at' | 'created_by' | 'updated_by'>) => Promise<Grant | null>
-  updateGrant: (id: string, updates: Partial<Grant>) => Promise<Grant | null>
-  deleteGrant: (id: string) => Promise<boolean>
-  restoreGrant: (id: string) => Promise<boolean>
-  getGrantById: (id: string) => Grant | undefined
-  hasPermission: (requiredRole: UserRole) => boolean
-}
+  grants: Grant[];
+  loading: boolean;
+  error: string | null;
+  currentGrant: Grant | null;
+  selectedGrant: Grant | null;
+  fetchGrants: () => Promise<void>;
+  addGrant: (grant: GrantInsert) => Promise<Grant | null>;
+  updateGrant: (id: string, updates: GrantUpdate) => Promise<Grant | null>;
+  deleteGrant: (id: string) => Promise<boolean>;
+  restoreGrant: (id: string) => Promise<boolean>;
+  setCurrentGrant: (grant: Grant | null) => void;
+  setSelectedGrant: (grant: Grant | null) => void;
+  getGrantById: (id: string) => Grant | undefined;
+  hasPermission: (permission: string) => boolean;
+};
 
-const GrantContext = createContext<GrantContextType | undefined>(undefined)
+const GrantContext = createContext<GrantContextType | undefined>(undefined);
 
-export function GrantProvider({ children }: { children: React.ReactNode }) {
-  const { user } = useAuth()
-  const [grants, setGrants] = useState<Grant[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  
-  const hasPermission = useCallback((requiredRole: UserRole): boolean => {
-    if (!user?.role) return false
-    
-    // Define role hierarchy with all possible roles
-    const roleHierarchy = {
-      'admin': 4,
-      'reviewer': 3,
-      'editor': 2,
-      'viewer': 1
-    } as const
-    
-    type RoleKey = keyof typeof roleHierarchy
-    
-    const userRole = user.role as RoleKey
-    const requiredRoleKey = requiredRole as RoleKey
-    
-    const userRoleLevel = userRole in roleHierarchy ? roleHierarchy[userRole] : 0
-    const requiredRoleLevel = requiredRoleKey in roleHierarchy ? roleHierarchy[requiredRoleKey] : 0
-    
-    return userRoleLevel >= requiredRoleLevel
-  }, [user?.role])
+type User = {
+  id: string;
+  email?: string;
+};
 
-  // Fetch grants on component mount and when user changes
-  useEffect(() => {
-    if (user) {
-      fetchGrants()
-    } else {
-      setGrants([])
-      setLoading(false)
-    }
-  }, [user])
+type SupabaseClient = any;
+
+type GrantContextProviderProps = {
+  children: React.ReactNode;
+  user?: User;
+  supabase?: SupabaseClient;
+  authLoading?: boolean;
+};
+
+const safeParseDate = (value: unknown): string | null => {
+  if (!value) return null;
+  const d = new Date(String(value));
+  return isNaN(d.getTime()) ? null : d.toISOString();
+};
+
+const safeParseNumber = (value: unknown): number => {
+  const num = Number(value);
+  return isNaN(num) ? 0 : num;
+};
+
+export const GrantProvider = ({
+  children,
+  user: propUser,
+  supabase: propSupabase,
+  authLoading: propAuthLoading,
+}: GrantContextProviderProps) => {
+  const auth = useAuth();
+  const user = propUser || auth.user;
+  const supabase = propSupabase || auth.supabase;
+  const authLoading = propAuthLoading ?? auth.loading ?? false;
+
+  const [grants, setGrants] = useState<Grant[]>([]);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [error, setError] = useState<string | null>(null);
+  const [currentGrant, setCurrentGrant] = useState<Grant | null>(null);
+  const [selectedGrant, setSelectedGrant] = useState<Grant | null>(null);
 
   const fetchGrants = useCallback(async () => {
-    try {
-      setLoading(true)
-      setError(null)
-      
-      console.log('Fetching grants from Supabase...')
-      const { data, error, status, statusText } = await getSupabaseClient()
-        .from('grants')
-        .select('*')
-        .is('deleted_at', null)
-      
-      console.log('Supabase response:', { data, error, status, statusText })
-      
-      if (error) {
-        console.error('Supabase error details:', error)
-        throw error
-      }
-      
-      if (!data) {
-        console.warn('No data returned from Supabase')
-        setGrants([])
-        return
-      }
-      
-      console.log(`Fetched ${data.length} grants from Supabase`)
-      const mappedGrants = data.map(mapDbGrantToGrant)
-      setGrants(mappedGrants)
-    } catch (err) {
-      console.error('Error in fetchGrants:', {
-        error: err,
-        message: err instanceof Error ? err.message : 'Unknown error',
-        stack: err instanceof Error ? err.stack : undefined
-      })
-      setError('Failed to load grants: ' + (err instanceof Error ? err.message : 'Unknown error'))
-      toast.error('Failed to load grants')
-    } finally {
-      setLoading(false)
-    }
-  }, [])
-
-  const addGrant = useCallback(async (grant: Omit<Grant, 'id' | 'created_at' | 'updated_at' | 'created_by' | 'updated_by'>) => {
-    if (!user) {
-      const errorMsg = 'You must be logged in to add a grant';
-      console.error(errorMsg);
-      setError(errorMsg);
-      toast.error(errorMsg);
-      return null;
+    if (!user?.id || !supabase) {
+      setLoading(false);
+      return;
     }
 
-    console.log('=== Starting addGrant ===');
-    console.log('User ID:', user.id);
-    console.log('Grant data received:', JSON.stringify(grant, null, 2));
-    
     setLoading(true);
     setError(null);
-    
+
     try {
-      // Only include fields that exist in the database schema
-      // Removed 'notes' field as it doesn't exist in the database
-      const safeGrant = {
-        name: grant.name,
-        donor: grant.donor,
-        type: grant.type,
-        category: grant.category,
-        amount: grant.amount,
-        status: grant.status,
-        applied_date: grant.applied_date,
-        deadline: grant.deadline,
-        last_follow_up: grant.last_follow_up || null,
-        next_follow_up: grant.next_follow_up || null,
-        amount_awarded: grant.amount_awarded || null,
-        outcome_summary: grant.outcome_summary || '',
-        responsible_person: grant.responsible_person || '',
-        progress_notes: grant.progress_notes || '',
-        // Removed 'notes' field as it doesn't exist in the database
-        user_id: user.id,
-        organization_id: 'default-org',
-        created_by: user.id,
-        updated_by: user.id,
-      };
+      let isViewer = false;
+      let userOrgId: string | null = null;
       
-      console.log('Prepared grant data for DB:', JSON.stringify(safeGrant, null, 2));
-      
-      console.log('Sending request to Supabase...');
-      const { data, error } = await getSupabaseClient()
-        .from('grants')
-        .insert(safeGrant)
-        .select()
-        .single();
-      
-      if (error) {
-        console.error('❌ Supabase insert error:', {
-          code: error.code,
-          message: error.message,
-          details: error.details,
-          hint: error.hint,
-        });
-        
-        // Try to get the database schema to help with debugging
-        try {
-          const { data: columns, error: schemaError } = await getSupabaseClient()
-            .from('information_schema.columns')
-            .select('column_name, data_type')
-            .eq('table_name', 'grants');
-            
-          if (!schemaError && columns) {
-            console.log('📋 Grants table schema:', columns);
-          }
-        } catch (schemaErr) {
-          console.error('Failed to fetch schema:', schemaErr);
+      // First try to get user profile and roles
+      try {
+        // Get user profile first to check organization
+        const { data: profileData, error: profileError } = await supabase
+          .from('profiles')
+          .select('organization_id')
+          .eq('id', user.id)
+          .single();
+
+        if (!profileError) {
+          userOrgId = profileData?.organization_id || null;
         }
-        
-        throw error;
+
+        // Then try to get user roles
+        const { data: rolesData, error: rolesError } = await supabase
+          .rpc('get_user_roles', { p_user_id: user.id });
+
+        if (!rolesError && Array.isArray(rolesData)) {
+          isViewer = rolesData.some((role: any) => role.role_name === 'viewer');
+        }
+      } catch (error) {
+        console.warn('Could not fetch user profile or roles, falling back to default behavior:', error);
+        // If there's an error, we'll proceed with default values
       }
-      
-      console.log('✅ Grant added successfully, response:', data);
-      
-      // Manually create the grant object to avoid mapping issues
-      const newGrant: Grant = {
-        id: data.id,
-        name: data.name,
-        donor: data.donor,
-        type: data.type,
-        category: data.category,
-        amount: data.amount,
-        status: data.status,
-        applied_date: data.applied_date,
-        deadline: data.deadline,
-        last_follow_up: data.last_follow_up || null,
-        next_follow_up: data.next_follow_up || null,
-        amount_awarded: data.amount_awarded || null,
-        outcome_summary: data.outcome_summary || '',
-        responsible_person: data.responsible_person || '',
-        progress_notes: data.progress_notes || '',
-        // Removed 'notes' field as it doesn't exist in the database
-        user_id: data.user_id,
-        organization_id: data.organization_id || 'default-org',
-        created_at: data.created_at || new Date().toISOString(),
-        updated_at: data.updated_at || new Date().toISOString(),
-        created_by: data.created_by || user.id,
-        updated_by: data.updated_by || user.id,
-      };
-      
-      setGrants(prev => [...prev, newGrant]);
-      toast.success('Grant added successfully');
-      return newGrant;
-      
+
+      // Start building the query
+      let query = supabase
+        .from('grants')
+        .select('*', { count: 'exact' })
+        .is('deleted_at', null);
+
+      // Apply organization filter if user is not a viewer and has an organization
+      if (!isViewer && userOrgId) {
+        query = query.eq('organization_id', userOrgId);
+      }
+
+      // Execute the query
+      const { data: grantsData, error: fetchError } = await query
+        .order('created_at', { ascending: false });
+
+      if (fetchError) {
+        console.error('Error fetching grants:', fetchError);
+        throw fetchError;
+      }
+
+      const processed = (grantsData || []).map((grant: any): Grant => ({
+        id: grant.id || '',
+        name: grant.name || '',
+        donor: grant.donor || '',
+        type: grant.type || '',
+        category: grant.category || '',
+        amount: safeParseNumber(grant.amount),
+        status: (grant.status || 'draft') as GrantStatus,
+        applied_date: safeParseDate(grant.applied_date),
+        deadline: safeParseDate(grant.deadline),
+        last_follow_up: safeParseDate(grant.last_follow_up),
+        next_follow_up: safeParseDate(grant.next_follow_up),
+        amount_awarded: grant.amount_awarded ? safeParseNumber(grant.amount_awarded) : null,
+        outcome_summary: grant.outcome_summary || null,
+        responsible_person: grant.responsible_person || null,
+        progress_notes: grant.progress_notes || null,
+        user_id: grant.user_id || user?.id || '',
+        created_at: grant.created_at || new Date().toISOString(),
+        updated_at: grant.updated_at || new Date().toISOString(),
+        created_by: grant.created_by || user?.id || '',
+        updated_by: grant.updated_by || user?.id || '',
+        deleted_at: safeParseDate(grant.deleted_at),
+        organization_id: grant.organization_id || null,
+      }));
+
+      setGrants(processed);
     } catch (err) {
-      const errorMsg = err instanceof Error ? `Failed to add grant: ${err.message}` : 'Failed to add grant';
-      console.error('❌ Error in addGrant:', {
-        error: err,
-        message: errorMsg,
-        stack: err instanceof Error ? err.stack : undefined,
-        timestamp: new Date().toISOString()
-      });
-      setError(errorMsg);
-      toast.error('Failed to add grant. Please check console for details.');
-      return null;
+      const error = err as Error | PostgrestError;
+      console.error('Error fetching grants:', error);
+      setError(error.message || 'Failed to fetch grants');
     } finally {
-      console.log('=== End of addGrant ===');
       setLoading(false);
     }
-  }, [user])
+  }, [user, supabase, setLoading, setError, setGrants]);
 
-  const updateGrant = useCallback(async (id: string, updates: Partial<Grant>) => {
-    if (!user) {
-      setError('You must be logged in to update a grant')
-      return null
+  const addGrant = useCallback(async (grantData: GrantInsert) => {
+    if (!user?.id || !supabase) {
+      throw new Error('User not authenticated or database not available');
+    }
+
+    // Get user's organization if not provided
+    if (!grantData.organization_id) {
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('organization_id')
+        .eq('id', user.id)
+        .single();
+      
+      if (profile?.organization_id) {
+        grantData.organization_id = profile.organization_id;
+      } else {
+        throw new Error('User is not associated with an organization');
+      }
     }
 
     try {
-      setLoading(true)
-      setError(null)
-      
-      const { data, error } = await getSupabaseClient()
+      setLoading(true);
+      setError(null);
+
+      const now = new Date().toISOString();
+
+      const newGrant = {
+        ...grantData,
+        created_by: user.id,
+        updated_by: user.id,
+        created_at: now,
+        updated_at: now,
+      };
+
+      const { data, error } = await supabase
+        .from('grants')
+        .insert(newGrant)
+        .select()
+        .single();
+
+      if (error || !data) throw error ?? new Error('Failed to create grant');
+
+      await fetchGrants();
+      toast.success('Grant created successfully');
+      return data as Grant;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to add grant.';
+      setError(msg);
+      toast.error(msg);
+      return null;
+    } finally {
+      setLoading(false);
+    }
+  }, [supabase, user, fetchGrants]);
+
+  const updateGrant = useCallback(async (id: string, updates: Partial<GrantUpdate>) => {
+    if (!user?.id || !supabase) {
+      throw new Error('User not authenticated or database not available');
+    }
+
+    // Ensure organization_id is not being changed
+    if ('organization_id' in updates) {
+      delete updates.organization_id;
+    }
+
+    try {
+      setLoading(true);
+      setError(null);
+
+      const { data, error } = await supabase
         .from('grants')
         .update({
           ...updates,
@@ -242,130 +284,142 @@ export function GrantProvider({ children }: { children: React.ReactNode }) {
         })
         .eq('id', id)
         .select()
-        .single()
-      
-      if (error) throw error
-      
-      const updatedGrant = mapDbGrantToGrant(data)
-      setGrants(prev => prev.map(g => g.id === id ? updatedGrant : g))
-      toast.success('Grant updated successfully')
-      return updatedGrant
-    } catch (err) {
-      console.error('Error updating grant:', err)
-      setError(err instanceof Error ? err.message : 'Failed to update grant')
-      toast.error('Failed to update grant')
-      return null
-    } finally {
-      setLoading(false)
-    }
-  }, [user])
+        .single();
 
-  const deleteGrant = useCallback(async (id: string): Promise<boolean> => {
-    if (!user) {
-      setError('You must be logged in to delete a grant')
-      return false
+      if (error || !data) throw error ?? new Error('Failed to update grant');
+
+      await fetchGrants();
+      toast.success('Grant updated');
+      return data as Grant;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to update grant.';
+      setError(msg);
+      toast.error(msg);
+      return null;
+    } finally {
+      setLoading(false);
     }
+  }, [supabase, user, fetchGrants]);
+
+  const deleteGrant = useCallback(async (id: string) => {
+    if (!user?.id || !supabase) return false;
 
     try {
-      setLoading(true)
-      setError(null)
-      
-      const { error } = await getSupabaseClient()
+      setLoading(true);
+
+      const { error } = await supabase
         .from('grants')
-        .update({ 
+        .update({
           deleted_at: new Date().toISOString(),
           updated_by: user.id,
           updated_at: new Date().toISOString(),
         })
-        .eq('id', id)
-      
-      if (error) throw error
-      
-      setGrants(prev => prev.filter(g => g.id !== id))
-      toast.success('Grant moved to trash')
-      return true
+        .eq('id', id);
+
+      if (error) throw error;
+
+      await fetchGrants();
+      toast.success('Grant deleted');
+      return true;
     } catch (err) {
-      console.error('Error deleting grant:', err)
-      setError(err instanceof Error ? err.message : 'Failed to delete grant')
-      toast.error('Failed to delete grant')
-      return false
+      const msg = err instanceof Error ? err.message : 'Failed to delete grant.';
+      setError(msg);
+      toast.error(msg);
+      return false;
     } finally {
-      setLoading(false)
+      setLoading(false);
     }
-  }, [user])
+  }, [supabase, user, fetchGrants]);
 
-  const restoreGrant = useCallback(async (id: string): Promise<boolean> => {
-    if (!user) {
-      setError('You must be logged in to restore grants')
-      return false
-    }
-
-    if (!hasPermission('editor')) {
-      setError('You do not have permission to restore grants')
-      return false
-    }
+  const restoreGrant = useCallback(async (id: string) => {
+    if (!user?.id || !supabase) return false;
 
     try {
-      setLoading(true)
-      setError(null)
-      
-      const { data, error } = await getSupabaseClient()
+      setLoading(true);
+
+      const { error } = await supabase
         .from('grants')
-        .update({ 
+        .update({
           deleted_at: null,
           updated_by: user.id,
           updated_at: new Date().toISOString(),
         })
-        .eq('id', id)
-        .select()
-        .single()
-      
-      if (error) throw error
-      
-      setGrants(prev => {
-        const exists = prev.some(g => g.id === id)
-        return exists ? prev : [...prev, mapDbGrantToGrant(data)]
-      })
-      
-      toast.success('Grant restored successfully')
-      return true
-    } catch (err) {
-      console.error('Error restoring grant:', err)
-      setError(err instanceof Error ? err.message : 'Failed to restore grant')
-      toast.error('Failed to restore grant')
-      return false
-    } finally {
-      setLoading(false)
-    }
-  }, [user, hasPermission])
+        .eq('id', id);
 
-  const getGrantById = (id: string) => {
-    return grants.find(grant => grant.id === id)
-  }
+      if (error) throw error;
+
+      await fetchGrants();
+      toast.success('Grant restored');
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to restore grant.';
+      setError(msg);
+      toast.error(msg);
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  }, [supabase, user, fetchGrants]);
+
+  const getGrantById = useCallback((id: string): Grant | undefined => {
+    if (!grants) return undefined;
+    return grants.find(grant => grant.id === id);
+  }, [grants]);
+
+  const hasPermission = useCallback((permission: string): boolean => {
+    if (!user) return false;
+    const role = (user as any)?.role ?? 'user';
+    return permission === 'admin' ? role === 'admin' : true;
+  }, [user]);
+
+  useEffect(() => {
+    if (!authLoading && user) fetchGrants();
+    if (!authLoading && !user) {
+      setGrants([]);
+      setLoading(false);
+    }
+  }, [authLoading, user, fetchGrants]);
+
+  const contextValue = useMemo(() => ({
+    grants,
+    loading,
+    error,
+    currentGrant,
+    selectedGrant,
+    fetchGrants,
+    addGrant,
+    updateGrant,
+    deleteGrant,
+    restoreGrant,
+    getGrantById,
+    setCurrentGrant,
+    setSelectedGrant,
+    hasPermission,
+  }), [
+    grants,
+    loading,
+    error,
+    currentGrant,
+    selectedGrant,
+    fetchGrants,
+    addGrant,
+    updateGrant,
+    deleteGrant,
+    restoreGrant,
+    getGrantById,
+  ]);
 
   return (
-    <GrantContext.Provider
-      value={{
-        grants,
-        loading,
-        error,
-        addGrant,
-        updateGrant,
-        deleteGrant,
-        restoreGrant,
-        getGrantById,
-        hasPermission,
-      }}
-    >
+    <GrantContext.Provider value={contextValue}>
       {children}
     </GrantContext.Provider>
-  )
-}
+  );
+};
 
-export const useGrants = () => {
-  const context = useContext(GrantContext)
-  if (context === undefined) {
-    throw new Error('useGrants must be used within a GrantProvider')
+export const useGrants = (): GrantContextType => {
+  const context = useContext(GrantContext);
+  if (!context) {
+    throw new Error('useGrants must be used within a GrantProvider');
   }
-  return context
-}
+  return context;
+};
