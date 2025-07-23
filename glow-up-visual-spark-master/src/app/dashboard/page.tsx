@@ -339,12 +339,11 @@ export default function DashboardPage() {
                   className={`border-purple-600 text-purple-600 hover:bg-purple-50 ${
                     isPending || isDonor ? 'opacity-70 cursor-not-allowed' : ''
                   }`}
-                  onClick={async () => {
+                  onClick={(e) => {
+                    e.preventDefault();
                     if (isPending || isDonor) return;
-                    const success = await requestDonorAccess();
-                    if (success) {
-                      alert('Your request to become a donor has been submitted for approval.');
-                    }
+                    // Navigate to the donation form page
+                    router.push('/donate');
                   }}
                   disabled={isPending || isDonor || donorLoading}
                 >

@@ -250,20 +250,9 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
         throw new Error('Please sign out before creating a new account');
       }
 
-      // Check if this is the first user
-      const { count: userCount, error: countError } = await supabase
-        .from('user_roles_denorm')
-        .select('*', { count: 'exact', head: true });
-
-      if (countError) {
-        console.error('Error checking user count:', countError);
-        throw new Error('Failed to check existing users');
-      }
-
-      const isFirstUser = userCount === 0;
-      // Only assign admin to the first user, others get viewer by default
-      const rolesToAssign = isFirstUser ? ['admin', 'viewer'] : ['viewer'];
-      console.log(`Assigning roles to new user: ${rolesToAssign.join(', ')}`);
+      // Always assign viewer role to new users
+      const rolesToAssign = ['viewer'];
+      console.log(`Assigning viewer role to new user`);
 
       // 1. Create the auth user
       const { data, error } = await supabase.auth.signUp({
@@ -313,18 +302,7 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
         throw new Error('Failed to assign user roles');
       }
 
-      // 4. If this is the first user (admin), create an organization for them
-      if (isFirstUser) {
-        const orgName = fullName ? `${fullName}'s Organization` : `${email.split('@')[0]}'s Organization`;
-        const orgId = await createOrganizationForAdmin(data.user.id, orgName);
-        
-        if (!orgId) {
-          console.error('Failed to create organization for admin user');
-          // Continue anyway, the user can create an org later
-        } else {
-          console.log(`Created organization ${orgId} for admin user ${data.user.id}`);
-        }
-      }
+      // Organization creation is now handled separately by an admin
 
       console.log(`User ${email} created successfully with roles: ${rolesToAssign.join(', ')}`);
       return { 
